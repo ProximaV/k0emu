@@ -30,6 +30,14 @@ public:
     bool LoadRomBytes(const uint8_t *data, size_t size, uint16_t base_addr = 0);
     bool LoadRomFile(const char *path, uint16_t base_addr = 0);
 
+    // Load 8 KB programmer mask ROM (78k0_programmer_fw.bin) and 0x800-byte Extra Area (EA.bin).
+    bool LoadProgrammerRomBytes(const uint8_t *data, size_t size);
+    bool LoadProgrammerRomFile(const char *path);
+    bool LoadEaBytes(const uint8_t *data, size_t size);
+    bool LoadEaFile(const char *path);
+
+    static bool ParseFlmd0Mode(const char *arg, Kx2FlashCtrl::Flmd0Mode *out);
+
     StopInfo Step(bool ignore_bpt_at_pc = false);
     StopInfo RunSteps(uint64_t max_steps,
                       bool ignore_bpt_at_first_pc = false,
@@ -41,6 +49,7 @@ public:
     std::string FormatClock() const;
     std::string FormatTimers() const;
     std::string FormatPorts() const;
+    std::string FormatFlash() const;
     std::string FormatMemoryMap() const;
     bool ExecuteCommand(const std::string &cmdline, std::string &out);
 
@@ -68,6 +77,7 @@ public:
     Kx2Csi csi11;
     Kx2Iic0 iic0;
     Kx2MulDiv muldiv;
+    Kx2FlashCtrl flash;
 
 private:
     void WirePeripherals();

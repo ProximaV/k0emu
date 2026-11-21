@@ -29,6 +29,7 @@
 #include "disasm.h"
 #include "log.h"
 #include "machine.h"
+#include "module_path.h"
 
 namespace {
 
@@ -127,6 +128,11 @@ const register_info_t kRegisters[] = {
     { "RESF",   0,                              RC_SYS,     dt_byte,  nullptr, 0 },
     { "LVIM",   0,                              RC_SYS,     dt_byte,  nullptr, 0 },
     { "LVIS",   0,                              RC_SYS,     dt_byte,  nullptr, 0 },
+    { "PFCMD",  0,                              RC_SYS,     dt_byte,  nullptr, 0 },
+    { "FLPMC",  0,                              RC_SYS,     dt_byte,  nullptr, 0 },
+    { "FLCTL",  0,                              RC_SYS,     dt_byte,  nullptr, 0 },
+    { "FLREG",  0,                              RC_SYS,     dt_byte,  nullptr, 0 },
+    { "PROD",   0,                              RC_SYS,     dt_byte,  nullptr, 0 },
     { "CYCLES", REGISTER_READONLY,              RC_SYS,     dt_qword, nullptr, 0 },
 
     // Timers (RC_TIMERS)
@@ -239,6 +245,11 @@ const RegBackingDesc kRegBacking[] = {
     { BACK_SFR8,    0xFFACu,   0 },
     { BACK_SFR8,    0xFFBEu,   0 },
     { BACK_SFR8,    0xFFBFu,   0 },
+    { BACK_SFR8,    0xFFC0u,   0 },
+    { BACK_SFR8,    0xFFC4u,   0 },
+    { BACK_SFR8,    0xFFC5u,   0 },
+    { BACK_SFR8,    0xFFCAu,   0 },
+    { BACK_SFR8,    0xFFF5u,   0 },
     { BACK_CYCLES,  0,         0 },
 
     // Timers
@@ -403,6 +414,8 @@ struct k0dbg_plugmod_t final : public plugmod_t {
     resume_mode_t resmod = RESMOD_NONE;
     bool ignore_bpt_once = false;
     uint16_t entry_pc = 0;
+    std::string custom_prog_rom_path;
+    std::string custom_ea_path;
 
     idd_listener_t idd_listener;
     idp_k0_listener_t idp_listener;
@@ -430,6 +443,9 @@ struct k0dbg_plugmod_t final : public plugmod_t {
     void UninstallHooks();
     void RegisterIdcFunctions();
     void UnregisterIdcFunctions();
+    std::string PluginDirectory() const;
+    bool LoadFlashAsset(bool is_prog_rom, const char *override_path, bool reset_to_default);
+    void AutoLoadFlashImages();
     void ResetSessionState();
     void DetectLayoutFromIdb(MachineProfile *profile_out,
                              uint16_t *rom_end_out,
@@ -442,6 +458,7 @@ struct k0dbg_plugmod_t final : public plugmod_t {
     void QueueStopEvent(const k0::StopInfo &stop, bool from_single_step);
     uint64_t ReadRegByIdx(size_t idx) const;
     void WriteRegByIdx(size_t idx, uint64_t val);
+    void InvalidateBusCacheOnChange(uint8_t prev_bank, uint8_t prev_ovl) const;
     void WriteRegAndInvalidate(size_t idx, uint64_t val);
     ssize_t HandleIddEvent(ssize_t code, va_list va);
     ssize_t HandleRexec(const char *cmdline);
@@ -665,6 +682,75 @@ uint16_t k0dbg_plugmod_t::DetermineEntryPc(uint16_t rom_end) const {
     return 0;
 }
 
+std::string k0dbg_plugmod_t::PluginDirectory() const {
+    return k0::GetModuleDirectoryForAddress(reinterpret_cast<const void *>(&g_debugger));
+}
+
+bool k0dbg_plugmod_t::LoadFlashAsset(bool is_prog_rom, const char *override_path, bool reset_to_default) {
+    const char *default_name = is_prog_rom ? "78k0_programmer_fw.bin" : "EA.bin";
+    const char *label = is_prog_rom ? "programmer ROM" : "Extra Area";
+    std::string &custom_ref = is_prog_rom ? custom_prog_rom_path : custom_ea_path;
+
+    if (reset_to_default) {
+        custom_ref.clear();
+    } else if (override_path && *override_path) {
+        const bool ok = is_prog_rom ? machine.LoadProgrammerRomFile(override_path)
+                                    : machine.LoadEaFile(override_path);
+        if (!ok) {
+            msg("[k0emu] Warning: failed to load %s image.\n", label);
+            return false;
+        }
+        custom_ref = override_path;
+        if (is_prog_rom) {
+            invalidate_dbgmem_contents(K0Bus::kProgRomLowStart, K0Bus::kProgRomSize);
+            invalidate_dbgmem_contents(K0Bus::kProgRomHighStart, K0Bus::kProgRomSize);
+        }
+        msg("[k0emu] Loaded %s (%u bytes).\n",
+            label,
+            static_cast<unsigned>(is_prog_rom ? K0Bus::kProgRomSize : k0::Kx2FlashCtrl::kEaSize));
+        return true;
+    }
+
+    const std::string target = custom_ref.empty()
+                                   ? k0::JoinPath(PluginDirectory(), default_name)
+                                   : custom_ref;
+    if (!k0::FileExists(target)) {
+        if (!custom_ref.empty()) {
+            msg("[k0emu] Warning: configured %s image is unavailable.\n", label);
+        } else if (reset_to_default) {
+            if (is_prog_rom) {
+                machine.bus.ClearProgrammerRom();
+                invalidate_dbgmem_contents(K0Bus::kProgRomLowStart, K0Bus::kProgRomSize);
+                invalidate_dbgmem_contents(K0Bus::kProgRomHighStart, K0Bus::kProgRomSize);
+            } else {
+                machine.flash.ClearEa();
+            }
+        }
+        return false;
+    }
+
+    const bool ok = is_prog_rom ? machine.LoadProgrammerRomFile(target.c_str())
+                                : machine.LoadEaFile(target.c_str());
+    if (!ok) {
+        msg("[k0emu] Warning: failed to parse %s file: %s\n", label, default_name);
+        return false;
+    }
+    if (is_prog_rom) {
+        invalidate_dbgmem_contents(K0Bus::kProgRomLowStart, K0Bus::kProgRomSize);
+        invalidate_dbgmem_contents(K0Bus::kProgRomHighStart, K0Bus::kProgRomSize);
+    }
+    msg("[k0emu] Loaded %s (%u bytes) from plugin directory: %s\n",
+        label,
+        static_cast<unsigned>(is_prog_rom ? K0Bus::kProgRomSize : k0::Kx2FlashCtrl::kEaSize),
+        default_name);
+    return true;
+}
+
+void k0dbg_plugmod_t::AutoLoadFlashImages() {
+    LoadFlashAsset(true, nullptr, false);
+    LoadFlashAsset(false, nullptr, false);
+}
+
 void k0dbg_plugmod_t::ResetSessionState() {
     MachineProfile profile = MachineProfile::Kx2;
     uint16_t rom_end = kDefaultRomEnd;
@@ -679,6 +765,7 @@ void k0dbg_plugmod_t::ResetSessionState() {
     machine.bus.ClearWatchpoints();
 
     LoadSegmentsFromIdb();
+    AutoLoadFlashImages();
     entry_pc = DetermineEntryPc(rom_end);
 
     // Reset AFTER loading ROM so Option Byte (0x0080) and vector table are visible to peripherals.
@@ -860,11 +947,22 @@ void k0dbg_plugmod_t::WriteRegByIdx(size_t idx, uint64_t val) {
     }
 }
 
+void k0dbg_plugmod_t::InvalidateBusCacheOnChange(uint8_t prev_bank, uint8_t prev_ovl) const {
+    if (machine.bus.GetActiveBank() != prev_bank) {
+        invalidate_dbgmem_contents(K0Bus::kBankWindowStart, K0Bus::kBankSize);
+    }
+    if (machine.bus.GetProgOverlayMask() != prev_ovl) {
+        invalidate_dbgmem_contents(K0Bus::kProgRomLowStart, K0Bus::kProgRomSize);
+        invalidate_dbgmem_contents(K0Bus::kProgRomHighStart, K0Bus::kProgRomSize);
+    }
+}
+
 void k0dbg_plugmod_t::WriteRegAndInvalidate(size_t idx, uint64_t val) {
     if (idx >= qnumber(kRegBacking)) {
         return;
     }
     const uint8_t prev_bank = machine.bus.GetActiveBank();
+    const uint8_t prev_ovl = machine.bus.GetProgOverlayMask();
     WriteRegByIdx(idx, val);
 
     const RegBackingDesc &d = kRegBacking[idx];
@@ -889,9 +987,7 @@ void k0dbg_plugmod_t::WriteRegAndInvalidate(size_t idx, uint64_t val) {
         invalidate_dbgmem_contents(d.param0, 2u);
     }
 
-    if (machine.bus.GetActiveBank() != prev_bank) {
-        invalidate_dbgmem_contents(K0Bus::kBankWindowStart, K0Bus::kBankSize);
-    }
+    InvalidateBusCacheOnChange(prev_bank, prev_ovl);
     invalidate_dbg_state(inv);
 }
 
@@ -902,6 +998,7 @@ ssize_t k0dbg_plugmod_t::HandleRexec(const char *cmdline) {
     if (!out.empty()) {
         msg("%s\n", out.c_str());
     }
+    invalidate_dbgmem_contents(0, BADADDR);
     invalidate_dbg_state(DBGINV_REGS | DBGINV_MEMORY);
     return 0;
 }
@@ -1240,6 +1337,7 @@ ssize_t k0dbg_plugmod_t::HandleIddEvent(ssize_t code, va_list va) {
             const size_t avail = static_cast<size_t>(K0Bus::kAddressSpaceSize - ea);
             const size_t to_write = std::min(size, avail);
             const uint8_t prev_bank = machine.bus.GetActiveBank();
+            const uint8_t prev_ovl = machine.bus.GetProgOverlayMask();
             if (!machine.bus.WriteDebug(static_cast<uint16_t>(ea), to_write, buffer)) {
                 *nbytes = 0;
                 return DRC_FAILED;
@@ -1247,9 +1345,7 @@ ssize_t k0dbg_plugmod_t::HandleIddEvent(ssize_t code, va_list va) {
             if (ea + to_write > K0Bus::kGprStart) {
                 invalidate_dbg_state(DBGINV_REGS);
             }
-            if (machine.bus.GetActiveBank() != prev_bank) {
-                invalidate_dbgmem_contents(K0Bus::kBankWindowStart, K0Bus::kBankSize);
-            }
+            InvalidateBusCacheOnChange(prev_bank, prev_ovl);
             *nbytes = to_write;
             return DRC_OK;
         }
@@ -1556,8 +1652,11 @@ error_t idaapi idc_k0dbg_write_u8(idc_value_t *argv, idc_value_t *r) {
     }
     const uint16_t addr = static_cast<uint16_t>(argv[0].num & 0xFFFF);
     const uint8_t val = static_cast<uint8_t>(argv[1].num & 0xFF);
+    const uint8_t prev_bank = pm->machine.bus.GetActiveBank();
+    const uint8_t prev_ovl = pm->machine.bus.GetProgOverlayMask();
     pm->machine.bus.PokeByte(addr, val);
     invalidate_dbgmem_contents(addr, 1);
+    pm->InvalidateBusCacheOnChange(prev_bank, prev_ovl);
     if (addr >= K0Bus::kGprStart) {
         invalidate_dbg_state(DBGINV_REGS);
     }
@@ -1590,6 +1689,8 @@ error_t idaapi idc_k0dbg_write_u16(idc_value_t *argv, idc_value_t *r) {
     }
     const uint16_t addr = static_cast<uint16_t>(argv[0].num & 0xFFFF);
     const uint16_t val = static_cast<uint16_t>(argv[1].num & 0xFFFF);
+    const uint8_t prev_bank = pm->machine.bus.GetActiveBank();
+    const uint8_t prev_ovl = pm->machine.bus.GetProgOverlayMask();
     const uint8_t buf[2] = {
         static_cast<uint8_t>(val & 0xFFu),
         static_cast<uint8_t>((val >> 8) & 0xFFu),
@@ -1599,6 +1700,7 @@ error_t idaapi idc_k0dbg_write_u16(idc_value_t *argv, idc_value_t *r) {
         return eOk;
     }
     invalidate_dbgmem_contents(addr, 2);
+    pm->InvalidateBusCacheOnChange(prev_bank, prev_ovl);
     if (addr + 2u > K0Bus::kGprStart) {
         invalidate_dbg_state(DBGINV_REGS);
     }
@@ -1636,7 +1738,37 @@ error_t idaapi idc_k0dbg_exec(idc_value_t *argv, idc_value_t *r) {
     }
     std::string out;
     pm->machine.ExecuteCommand(argv[0].c_str(), out);
+    invalidate_dbgmem_contents(0, BADADDR);
+    invalidate_dbg_state(DBGINV_REGS | DBGINV_MEMORY);
     r->set_string(out.c_str());
+    return eOk;
+}
+
+error_t idaapi idc_k0dbg_load_prog_rom(idc_value_t *argv, idc_value_t *r) {
+    k0dbg_plugmod_t *pm = g_active_plugmod;
+    if (!pm) {
+        r->set_long(0);
+        return eOk;
+    }
+    const char *path = argv[0].c_str();
+    const bool empty = (!path || !*path);
+    const bool ok = pm->LoadFlashAsset(true, path, empty);
+    invalidate_dbg_state(DBGINV_REGS | DBGINV_MEMORY);
+    r->set_long(ok ? 1 : 0);
+    return eOk;
+}
+
+error_t idaapi idc_k0dbg_load_ea(idc_value_t *argv, idc_value_t *r) {
+    k0dbg_plugmod_t *pm = g_active_plugmod;
+    if (!pm) {
+        r->set_long(0);
+        return eOk;
+    }
+    const char *path = argv[0].c_str();
+    const bool empty = (!path || !*path);
+    const bool ok = pm->LoadFlashAsset(false, path, empty);
+    invalidate_dbg_state(DBGINV_REGS | DBGINV_MEMORY);
+    r->set_long(ok ? 1 : 0);
     return eOk;
 }
 
@@ -1647,19 +1779,21 @@ const char kArgsStrLong[] = { VT_STR, VT_LONG, 0 };
 const char kArgsLongLong[] = { VT_LONG, VT_LONG, 0 };
 
 const ext_idcfunc_t kIdcFuncs[] = {
-    { "k0dbg_start",     idc_k0dbg_start,     kArgsNone,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_stop",      idc_k0dbg_stop,      kArgsNone,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_step",      idc_k0dbg_step,      kArgsLong,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_run_to",    idc_k0dbg_run_to,    kArgsLongLong, nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_get_reg",   idc_k0dbg_get_reg,   kArgsStr,      nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_set_reg",   idc_k0dbg_set_reg,   kArgsStrLong,  nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_read_u8",   idc_k0dbg_read_u8,   kArgsLong,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_write_u8",  idc_k0dbg_write_u8,  kArgsLongLong, nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_read_u16",  idc_k0dbg_read_u16,  kArgsLong,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_write_u16", idc_k0dbg_write_u16, kArgsLongLong, nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_add_bpt",   idc_k0dbg_add_bpt,   kArgsLong,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_del_bpt",   idc_k0dbg_del_bpt,   kArgsLong,     nullptr, 0, EXTFUN_BASE },
-    { "k0dbg_exec",      idc_k0dbg_exec,      kArgsStr,      nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_start",         idc_k0dbg_start,         kArgsNone,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_stop",          idc_k0dbg_stop,          kArgsNone,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_step",          idc_k0dbg_step,          kArgsLong,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_run_to",        idc_k0dbg_run_to,        kArgsLongLong, nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_get_reg",       idc_k0dbg_get_reg,       kArgsStr,      nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_set_reg",       idc_k0dbg_set_reg,       kArgsStrLong,  nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_read_u8",       idc_k0dbg_read_u8,       kArgsLong,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_write_u8",      idc_k0dbg_write_u8,      kArgsLongLong, nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_read_u16",      idc_k0dbg_read_u16,      kArgsLong,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_write_u16",     idc_k0dbg_write_u16,     kArgsLongLong, nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_add_bpt",       idc_k0dbg_add_bpt,       kArgsLong,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_del_bpt",       idc_k0dbg_del_bpt,       kArgsLong,     nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_exec",          idc_k0dbg_exec,          kArgsStr,      nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_load_prog_rom", idc_k0dbg_load_prog_rom, kArgsStr,      nullptr, 0, EXTFUN_BASE },
+    { "k0dbg_load_ea",       idc_k0dbg_load_ea,       kArgsStr,      nullptr, 0, EXTFUN_BASE },
 };
 
 void k0dbg_plugmod_t::RegisterIdcFunctions() {

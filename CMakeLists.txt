@@ -12,6 +12,7 @@ set(K0EMU_CORE_SOURCES
     src/log.cpp
     src/machine.cpp
     src/memory.cpp
+    src/module_path.cpp
 )
 
 add_library(k0emu_core STATIC ${K0EMU_CORE_SOURCES})
@@ -26,7 +27,7 @@ if(WIN32)
     target_link_libraries(k0emu_core PUBLIC ws2_32)
 else()
     find_package(Threads REQUIRED)
-    target_link_libraries(k0emu_core PUBLIC Threads::Threads)
+    target_link_libraries(k0emu_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
 if(MSVC)

@@ -602,6 +602,416 @@ void TestBreakpointsWatchpointsDisasmAndGdb() {
     EXPECT_TRUE(!status_hex.empty() && status_hex != "E01");
 }
 
+bool TryLoadProgrammerRomFromRepo(k0::K0Machine &m) {
+    static const char *const kRelPaths[] = {
+        "78k0_programmer_fw.bin",
+        "../78k0_programmer_fw.bin",
+        "../../78k0_programmer_fw.bin",
+    };
+    for (const char *p : kRelPaths) {
+        if (m.LoadProgrammerRomFile(p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void WriteProtectedReg(K0Bus &bus, uint16_t addr, uint8_t value) {
+    bus.WriteCpu(0xFFC0u, 0xA5u);
+    bus.WriteCpu(addr, value);
+    bus.WriteCpu(addr, static_cast<uint8_t>(~value));
+    bus.WriteCpu(addr, value);
+}
+
+void TestProgrammerRomAndEaFlash() {
+    // 1. PFCMD (0xFFC0) write-protection state machine on FLPMC (0xFFC4) & FLREG (0xFFCA)
+    {
+        auto m = MakeMachine();
+        std::vector<uint8_t> dummy_prog(K0Bus::kProgRomSize, 0xAAu);
+        EXPECT_TRUE(m.LoadProgrammerRomBytes(dummy_prog.data(), dummy_prog.size()));
+
+        // Unprotected write rejected
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x03u, 0u);
+
+        // Wrong complement rejected
+        m.bus.WriteCpu(0xFFC0u, 0xA5u);
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        m.bus.WriteCpu(0xFFC4u, 0xAAu);
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+
+        // Wrong 3rd confirmation rejected
+        m.bus.WriteCpu(0xFFC0u, 0xA5u);
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        m.bus.WriteCpu(0xFFC4u, 0xFEu);
+        m.bus.WriteCpu(0xFFC4u, 0x03u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+
+        // Switching target register mid-sequence rejected
+        m.bus.WriteCpu(0xFFC0u, 0xA5u);
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        m.bus.WriteCpu(0xFFCAu, 0xFEu);
+        m.bus.WriteCpu(0xFFC4u, 0x01u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+
+        // Valid sequences for 0xFFC4 and 0xFFCA
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x01u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 1u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x03u, 1u);
+
+        m.bus.WriteCpu(0xFFCAu, 0x01u);  // unprotected FLREG write ignored
+        EXPECT_EQ(m.bus.PeekByte(0xFFCAu), 0x00u);
+        WriteProtectedReg(m.bus, 0xFFCAu, 0x81u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFCAu), 0x81u);
+    }
+
+    // 2. Two-stage overlay (8 KB and 64 KB images, plus 32 KB chip where 0x8000 is above rom_end)
+    {
+        k0::K0Machine m;
+        m.Configure(MachineProfile::Kx2, 0x8000u, 0xF400u, 0xF800u);  // 32 KB user ROM
+        m.bus.ClearMemory();
+        m.bus.PokeByte(0x0010u, 0x12u);
+        m.bus.PokeByte(0x0123u, 0x34u);
+
+        // 8 KB programmer ROM
+        std::vector<uint8_t> prog8k(K0Bus::kProgRomSize, 0xFFu);
+        prog8k[0x0010u] = 0x5Au;
+        prog8k[0x0123u] = 0x7Bu;
+        EXPECT_TRUE(m.LoadProgrammerRomBytes(prog8k.data(), prog8k.size()));
+        m.Reset(0x0100);
+
+        EXPECT_EQ(m.bus.PeekByte(0x0010u), 0x12u);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0xFFu);  // unmapped above 0x8000
+
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x01u);   // bit 0 -> high window only
+        EXPECT_EQ(m.bus.PeekByte(0x0010u), 0x12u);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0x5Au);
+        EXPECT_EQ(m.bus.PeekByte(0x8123u), 0x7Bu);
+
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x03u);   // bits 0|1 -> both windows
+        EXPECT_EQ(m.bus.PeekByte(0x0010u), 0x5Au);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0x5Au);
+
+        // Mask ROM is read-only even via Poke/WriteCpu
+        m.bus.WriteCpu(0x8010u, 0x00u);
+        m.bus.PokeByte(0x0010u, 0x00u);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0x5Au);
+        EXPECT_EQ(m.bus.PeekByte(0x0010u), 0x5Au);
+
+        // Clear bit 1 -> unmaps low window, keeps high window
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x09u);
+        EXPECT_EQ(m.bus.PeekByte(0x0010u), 0x12u);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0x5Au);
+
+        // Clear bit 0 -> unmaps both
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x00u);
+        EXPECT_EQ(m.bus.PeekByte(0x8010u), 0xFFu);
+
+        // 64 KB dump with programmer image populated only at 0x8000..0x9FFF
+        std::vector<uint8_t> prog64k(0x10000u, 0xFFu);
+        prog64k[0x8055u] = 0xC3u;
+        EXPECT_TRUE(m.LoadProgrammerRomBytes(prog64k.data(), prog64k.size()));
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x03u);
+        EXPECT_EQ(m.bus.PeekByte(0x0055u), 0xC3u);
+        EXPECT_EQ(m.bus.PeekByte(0x8055u), 0xC3u);
+    }
+
+    // 3. FLMD0 pin modes & 0xFFF5 product ID derivation
+    {
+        k0::K0Machine m;
+        auto check_prod = [&](uint32_t rom_size, uint8_t expected_prod) {
+            m.Configure(MachineProfile::Kx2,
+                        static_cast<uint16_t>(rom_size <= 0xF000u ? rom_size : 0xC000u),
+                        0xF400u, 0xF800u);
+            if (rom_size > 0xF000u) {
+                std::vector<uint8_t> big(rom_size, 0xFFu);
+                EXPECT_TRUE(m.LoadRomBytes(big.data(), big.size(), 0));
+            }
+            EXPECT_EQ(m.bus.PeekByte(0xFFF5u), expected_prod);
+        };
+        check_prod(0x4000u, 0x10u);
+        check_prod(0x6000u, 0x20u);
+        check_prod(0x8000u, 0x30u);
+        check_prod(0xC000u, 0x40u);
+        check_prod(0xF000u, 0x50u);
+        check_prod(0x18000u, 0x60u);
+        check_prod(0x20000u, 0x70u);
+
+        // 0xFFF5 is CPU read-only, overridable via Poke/SetProductOverride
+        m.bus.WriteCpu(0xFFF5u, 0x00u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFF5u), 0x70u);
+        m.bus.PokeByte(0xFFF5u, 0x42u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFF5u), 0x42u);
+        m.flash.SetProductOverride(-1);
+        EXPECT_EQ(m.bus.PeekByte(0xFFF5u), 0x70u);
+
+        // FLMD0 modes
+        m.Reset(0x0100);
+        m.flash.SetFlmd0Mode(k0::Kx2FlashCtrl::Flmd0Mode::High);
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x04u, 0x04u);
+        m.flash.SetFlmd0Mode(k0::Kx2FlashCtrl::Flmd0Mode::Low);
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x04u, 0x00u);
+        m.flash.SetFlmd0Mode(k0::Kx2FlashCtrl::Flmd0Mode::PinP23);
+        m.bus.WriteCpu(0xFF22u, 0xF3u);  // PM2.3 = output
+        m.bus.WriteCpu(0xFF02u, 0x00u);  // P2.3 = 0
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x04u, 0x00u);
+        m.bus.WriteCpu(0xFF02u, 0x08u);  // P2.3 = 1
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x04u, 0x04u);
+    }
+
+    // 4. Extra Area (0x800 bytes) & main-flash reads through 0xF8F2..0xF8F5 swapped halfwords
+    {
+        auto m = MakeMachine();
+        std::vector<uint8_t> ea(k0::Kx2FlashCtrl::kEaSize, 0xEEu);
+        ea[0x0790u] = 0x11u;
+        ea[0x0791u] = 0x22u;
+        ea[0x0792u] = 0x33u;
+        ea[0x0793u] = 0x44u;
+        EXPECT_TRUE(m.LoadEaBytes(ea.data(), ea.size()));
+
+        std::vector<uint8_t> prog(K0Bus::kProgRomSize, 0xAAu);
+        prog[0x0100u] = 0x01u;
+        prog[0x0101u] = 0x02u;
+        prog[0x0102u] = 0x03u;
+        prog[0x0103u] = 0x04u;
+        EXPECT_TRUE(m.LoadProgrammerRomBytes(prog.data(), prog.size()));
+
+        // Underlying main flash at 0x0100..0x0103
+        WriteBytes(m, 0x0100u, { 0xDEu, 0xADu, 0xBEu, 0xEFu });
+
+        // Enable both overlays (FLPMC = 0x03)
+        WriteProtectedReg(m.bus, 0xFFC4u, 0x03u);
+
+        // Read EA at 0x0790
+        WriteProtectedReg(m.bus, 0xFFCAu, 0x01u);  // EA region
+        m.bus.WriteCpu(0xFFC7u, 0x00u);
+        m.bus.WriteCpu(0xFFC8u, 0x90u);
+        m.bus.WriteCpu(0xFFC9u, 0x07u);
+        m.bus.WriteCpu(0xFFC6u, 0x00u);
+        m.bus.WriteCpu(0xFFC1u, 0x80u);
+        m.bus.WriteCpu(0xFFC5u, 0x08u);
+        m.bus.WriteCpu(0xFFC5u, 0x0Au);            // rising edge bit 1
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F4u), 0x11u);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F5u), 0x22u);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F2u), 0x33u);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F3u), 0x44u);
+
+        // Out-of-range EA offset (>= 0x800) returns 0xFF
+        m.bus.WriteCpu(0xFFC8u, 0x00u);
+        m.bus.WriteCpu(0xFFC9u, 0x08u);
+        m.bus.WriteCpu(0xFFC5u, 0x08u);
+        m.bus.WriteCpu(0xFFC5u, 0x0Au);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F4u), 0xFFu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F5u), 0xFFu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F2u), 0xFFu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F3u), 0xFFu);
+
+        // Main flash read (0xFFCA=0x00) bypasses prog_rom_ overlay even with FLPMC=0x03
+        WriteProtectedReg(m.bus, 0xFFCAu, 0x00u);
+        m.bus.WriteCpu(0xFFC8u, 0x00u);
+        m.bus.WriteCpu(0xFFC9u, 0x01u);
+        m.bus.WriteCpu(0xFFC6u, 0x00u);
+        m.bus.WriteCpu(0xFFC5u, 0x08u);
+        m.bus.WriteCpu(0xFFC5u, 0x0Au);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F4u), 0xDEu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F5u), 0xADu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F2u), 0xBEu);
+        EXPECT_EQ(m.bus.ReadCpu(0xF8F3u), 0xEFu);
+    }
+
+    // 5. Self-contained CPU execution test exercising overlay switch, EA read, unmap, and return
+    {
+        auto m = MakeMachine();
+        m.cpu.SetSP(0xFECEu);
+        m.cpu.stop_on_brk = true;
+
+        std::vector<uint8_t> ea(k0::Kx2FlashCtrl::kEaSize, 0xFFu);
+        ea[0x0790u] = 0xA1u; ea[0x0791u] = 0xB2u; ea[0x0792u] = 0xC3u; ea[0x0793u] = 0xD4u;
+        EXPECT_TRUE(m.LoadEaBytes(ea.data(), ea.size()));
+
+        std::vector<uint8_t> prog(K0Bus::kProgRomSize, 0xFFu);
+        // Helper in prog_rom at 0x0180 (called as !0x0180 once FLPMC.1=1)
+        const uint8_t helper[] = {
+            0x71, 0x1B, 0xC5,        // clr1 0xFFC5.1
+            0x71, 0x1A, 0xC5,        // set1 0xFFC5.1 (rising edge latches 0xF8F2..0xF8F5)
+            0xAF,                    // ret
+        };
+        std::memcpy(prog.data() + 0x0180u, helper, sizeof(helper));
+
+        // Firmware entry in prog_rom at 0x0100 (called as !0x8100 from user code)
+        const uint8_t fw_entry[] = {
+            0x13, 0xC0, 0xA5,        // mov PFCMD, #0xA5
+            0x13, 0xC4, 0x03,        // mov FLPMC, #0x03
+            0x13, 0xC4, 0xFC,        // mov FLPMC, #0xFC
+            0x13, 0xC4, 0x03,        // mov FLPMC, #0x03 (low + high overlay)
+            0x13, 0xC0, 0xA5,        // mov PFCMD, #0xA5
+            0x13, 0xCA, 0x01,        // mov FLREG, #0x01 (EA)
+            0x13, 0xCA, 0xFE,        // mov FLREG, #0xFE
+            0x13, 0xCA, 0x01,        // mov FLREG, #0x01
+            0x13, 0xC8, 0x90,        // mov FLADRL, #0x90
+            0x13, 0xC9, 0x07,        // mov FLADRM, #0x07
+            0x13, 0xC6, 0x00,        // mov FLADRH, #0x00
+            0x13, 0xC7, 0x00,        // mov FLSTS, #0x00
+            0x13, 0xC1, 0x80,        // mov FLM0, #0x80
+            0x71, 0x3A, 0xC5,        // set1 0xFFC5.3
+            0x9A, 0x80, 0x01,        // call !0x0180 (uses low overlay)
+            0x8E, 0xF4, 0xF8,        // mov A, !0xF8F4
+            0x9E, 0x58, 0xFD,        // mov !0xFD58, A
+            0x8E, 0xF5, 0xF8,        // mov A, !0xF8F5
+            0x9E, 0x59, 0xFD,        // mov !0xFD59, A
+            0x8E, 0xF2, 0xF8,        // mov A, !0xF8F2
+            0x9E, 0x5A, 0xFD,        // mov !0xFD5A, A
+            0x8E, 0xF3, 0xF8,        // mov A, !0xF8F3
+            0x9E, 0x5B, 0xFD,        // mov !0xFD5B, A
+            0x13, 0xC0, 0xA5,        // mov PFCMD, #0xA5
+            0x13, 0xC4, 0x09,        // mov FLPMC, #0x09 (unmap low)
+            0x13, 0xC4, 0xF6,        // mov FLPMC, #0xF6
+            0x13, 0xC4, 0x09,        // mov FLPMC, #0x09
+            0xAF,                    // ret
+        };
+        std::memcpy(prog.data() + 0x0100u, fw_entry, sizeof(fw_entry));
+        EXPECT_TRUE(m.LoadProgrammerRomBytes(prog.data(), prog.size()));
+
+        // User code at 0x0200 (safe from low overlay)
+        WriteBytes(m, 0x0200u, {
+            0x13, 0xC0, 0xA5,        // mov PFCMD, #0xA5
+            0x13, 0xC4, 0x01,        // mov FLPMC, #0x01
+            0x13, 0xC4, 0xFE,        // mov FLPMC, #0xFE
+            0x13, 0xC4, 0x01,        // mov FLPMC, #0x01
+            0x9A, 0x00, 0x81,        // call !0x8100
+            0x13, 0xC0, 0xA5,        // mov PFCMD, #0xA5
+            0x13, 0xC4, 0x00,        // mov FLPMC, #0x00
+            0x13, 0xC4, 0xFF,        // mov FLPMC, #0xFF
+            0x13, 0xC4, 0x00,        // mov FLPMC, #0x00
+            0xBF,                    // brk
+        });
+        m.cpu.SetPC(0x0200u);
+        const auto stop = m.RunSteps(1000);
+        EXPECT_EQ(static_cast<int>(stop.reason), static_cast<int>(k0::StopReason::BreakInsn));
+        EXPECT_EQ(m.bus.PeekByte(0xFD58u), 0xA1u);
+        EXPECT_EQ(m.bus.PeekByte(0xFD59u), 0xB2u);
+        EXPECT_EQ(m.bus.PeekByte(0xFD5Au), 0xC3u);
+        EXPECT_EQ(m.bus.PeekByte(0xFD5Bu), 0xD4u);
+        EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u), 0x04u);
+    }
+
+    // 6. Diagnostics / CLI flash commands / FLASH_BUF region
+    {
+        auto m = MakeMachine();
+        const auto regs = m.bus.GetRegions();
+        bool found_flash_buf = false;
+        for (const auto &r : regs) {
+            if (r.name == "FLASH_BUF" && r.start == 0xF8F0u && r.size == 0x10u) {
+                found_flash_buf = true;
+            }
+        }
+        EXPECT_TRUE(found_flash_buf);
+
+        std::string cmd_out;
+        EXPECT_TRUE(m.ExecuteCommand("flash", cmd_out));
+        EXPECT_TRUE(cmd_out.find("PROD(FFF5)=40") != std::string::npos);
+        EXPECT_TRUE(m.ExecuteCommand("flmd0 0", cmd_out));
+        EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x04u, 0u);
+        EXPECT_TRUE(m.ExecuteCommand("product 0x60", cmd_out));
+        EXPECT_EQ(m.bus.PeekByte(0xFFF5u), 0x60u);
+        EXPECT_TRUE(m.ExecuteCommand("product auto", cmd_out));
+        EXPECT_EQ(m.bus.PeekByte(0xFFF5u), 0x40u);
+    }
+
+    // 7. Real 78k0_programmer_fw.bin end-to-end verification (when available in workspace)
+    {
+        auto m = MakeMachine();
+        if (TryLoadProgrammerRomFromRepo(m)) {
+            std::vector<uint8_t> ea(k0::Kx2FlashCtrl::kEaSize, 0xFFu);
+            for (size_t i = 0; i < 8; ++i) {
+                ea[0x0790u + i] = static_cast<uint8_t>(0x30u + i);
+            }
+            EXPECT_TRUE(m.LoadEaBytes(ea.data(), ea.size()));
+
+            // Distinct user ROM bytes at 0x0100..0x0103 to test FLREG=0x00 main-flash bypass
+            WriteBytes(m, 0x0100u, { 0x51u, 0x62u, 0x73u, 0x84u });
+
+            // Stub helpers matching TA-096 (at 0x57AF..0x57FA) + test driver at 0x5500
+            WriteBytes(m, 0x57AFu, {
+                0x13, 0xC0, 0xA5, 0x13, 0xC4, 0x01, 0x13, 0xC4, 0xFE, 0x13, 0xC4, 0x01, 0xAF,  // enable_programmer (0x57AF)
+                0x13, 0xC0, 0xA5, 0x13, 0xC4, 0x00, 0x13, 0xC4, 0xFF, 0x13, 0xC4, 0x00, 0xAF,  // disable_programmer (0x57BC)
+                0x22, 0xB1, 0x61, 0xF8, 0xB6, 0xA2, 0x00, 0x9A, 0x00, 0x81,
+                0xA1, 0x09, 0xBE, 0x13, 0xBE, 0x14, 0x23, 0xAF,                                // rom_func_0 (0x57C9)
+                0x22, 0x61, 0xF8, 0xA2, 0x0E, 0x9A, 0x00, 0x81, 0x23,
+                0xF0, 0xE3, 0x72, 0xA3, 0x00, 0xAF,                                            // rom_func_E (0x57DB)
+                0x22, 0xB1, 0x61, 0xF8, 0xB6, 0xA2, 0x0F, 0x9A, 0x00, 0x81, 0x23,
+                0xF0, 0xE3, 0x72, 0xA3, 0x00, 0xAF,                                            // rom_func_F (0x57EA)
+            });
+
+            // Driver at 0x5500:
+            // enable_programmer -> rom_func_0(0xFD60) -> rom_func_E (store C to 0xFD4F)
+            // -> rom_func_F(EA 0x0790 -> 0xFD58) -> rom_func_F(EA 0x0794 -> 0xFD5C)
+            // -> rom_func_F(MAIN 0x0100 -> 0xFD50) -> disable_programmer -> brk
+            WriteBytes(m, 0x5500u, {
+                0x9A, 0xAF, 0x57,              // call !enable_programmer
+                0x10, 0x60, 0xFD,              // movw AX, #0xFD60
+                0x9A, 0xC9, 0x57,              // call !rom_func_0
+                0x9A, 0xDB, 0x57,              // call !rom_func_E
+                0x62,                          // mov A, C
+                0x9E, 0x4F, 0xFD,              // mov !0xFD4F, A
+
+                // EA read #1: 0x0790 -> 0xFD58
+                0x10, 0x90, 0x07, 0x03, 0x60, 0xFD,
+                0x10, 0x00, 0xFF, 0x03, 0x62, 0xFD,
+                0x10, 0x58, 0xFD, 0x03, 0x64, 0xFD,
+                0x10, 0x60, 0xFD, 0x9A, 0xEA, 0x57,
+
+                // EA read #2: 0x0794 -> 0xFD5C
+                0x10, 0x94, 0x07, 0x03, 0x60, 0xFD,
+                0x10, 0x5C, 0xFD, 0x03, 0x64, 0xFD,
+                0x10, 0x60, 0xFD, 0x9A, 0xEA, 0x57,
+                0x62, 0x9E, 0x4E, 0xFD,        // save last status C to 0xFD4E
+
+                // Main flash read: addr=0x0100, flag=0x00 -> 0xFD50
+                0x10, 0x00, 0x01, 0x03, 0x60, 0xFD,
+                0x10, 0x00, 0x00, 0x03, 0x62, 0xFD,
+                0x10, 0x50, 0xFD, 0x03, 0x64, 0xFD,
+                0x10, 0x60, 0xFD, 0x9A, 0xEA, 0x57,
+                0x62, 0x9E, 0x4D, 0xFD,        // save main-flash status C to 0xFD4D
+
+                0x9A, 0xBC, 0x57,              // call !disable_programmer
+                0xBF,                          // brk
+            });
+
+            m.cpu.SetSP(0xFECEu);
+            m.cpu.stop_on_brk = true;
+            m.cpu.SetPC(0x5500u);
+            const auto s1 = m.RunSteps(200000);
+            EXPECT_EQ(static_cast<int>(s1.reason), static_cast<int>(k0::StopReason::BreakInsn));
+            EXPECT_EQ(m.bus.PeekByte(0xFD4Fu), 0x00u);  // CheckFLMD_E == 0
+            EXPECT_EQ(m.bus.PeekByte(0xFD4Eu), 0x00u);  // EA read status == 0
+            EXPECT_EQ(m.bus.PeekByte(0xFD4Du), 0x00u);  // Main flash read status == 0
+            for (size_t i = 0; i < 8; ++i) {
+                EXPECT_EQ(m.bus.PeekByte(static_cast<uint16_t>(0xFD58u + i)),
+                          static_cast<uint8_t>(0x30u + i));
+            }
+            EXPECT_EQ(m.bus.PeekByte(0xFD50u), 0x51u);
+            EXPECT_EQ(m.bus.PeekByte(0xFD51u), 0x62u);
+            EXPECT_EQ(m.bus.PeekByte(0xFD52u), 0x73u);
+            EXPECT_EQ(m.bus.PeekByte(0xFD53u), 0x84u);
+            EXPECT_EQ(m.bus.GetProgOverlayMask(), 0u);
+            EXPECT_EQ(m.bus.PeekByte(0xFFC4u) & 0x03u, 0u);
+
+            // Also verify CheckFLMD_E returns 1 when FLMD0 pin is low
+            m.Reset(0x5500);
+            m.cpu.SetSP(0xFECEu);
+            m.cpu.stop_on_brk = true;
+            m.flash.SetFlmd0Mode(k0::Kx2FlashCtrl::Flmd0Mode::Low);
+            const auto s2 = m.RunSteps(200000);
+            EXPECT_EQ(static_cast<int>(s2.reason), static_cast<int>(k0::StopReason::BreakInsn));
+            EXPECT_EQ(m.bus.PeekByte(0xFD4Fu), 0x01u);  // CheckFLMD_E == 1
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -611,6 +1021,7 @@ int main() {
     TestInterruptsPriorityHoldAndStandbyWakeup();
     TestKx2Peripherals();
     TestBreakpointsWatchpointsDisasmAndGdb();
+    TestProgrammerRomAndEaFlash();
 
     if (g_failures == 0) {
         std::printf("[PASS] All k0emu C++ tests passed.\n");

@@ -10,8 +10,8 @@ The original Python reference implementation in `k0emu/` (`bus.py`, `system.py`,
 
 | Component | Source Files | Output | Description |
 | --- | --- | --- | --- |
-| Core library | `src/cpu.{h,cpp}`, `src/memory.{h,cpp}`, `src/kx2_peripherals.{h,cpp}`, `src/machine.{h,cpp}`, `src/disasm.{h,cpp}`, `src/debugger.{h,cpp}`, `src/log.{h,cpp}` | `k0emu_core.lib` | Cycle-accurate 78K0 CPU, 64 KB + banked memory bus, Kx2 / Legacy 0831Y peripherals, disassembler, CLI command processor, GDB RSP server |
-| IDA Debugger Plugin | `src/ida_dbg_plugin.cpp` | `k0dbg.dll` | Native IDA Pro 9.x `PLUGIN_DBG \| PLUGIN_PROC \| PLUGIN_MULTI` debugger backend (`k0emu`) with `HT_IDD`, `HT_IDP`, `HT_UI`, and `k0dbg_*` IDC helpers |
+| Core library | `src/cpu.{h,cpp}`, `src/memory.{h,cpp}`, `src/kx2_peripherals.{h,cpp}`, `src/machine.{h,cpp}`, `src/disasm.{h,cpp}`, `src/debugger.{h,cpp}`, `src/log.{h,cpp}`, `src/module_path.{h,cpp}` | `k0emu_core.lib` | Cycle-accurate 78K0 CPU, 64 KB + banked memory bus, programmer ROM overlay, Kx2 / Legacy 0831Y peripherals, Extra Area flash controller, disassembler, CLI command processor, GDB RSP server |
+| IDA Debugger Plugin | `src/ida_dbg_plugin.cpp` | `k0dbg.dll` | Native IDA Pro 9.x `PLUGIN_DBG \| PLUGIN_PROC \| PLUGIN_MULTI` debugger backend (`k0emu`) with `HT_IDD`, `HT_IDP`, `HT_UI`, automatic plugin-directory `78k0_programmer_fw.bin` & `EA.bin` loading, and `k0dbg_*` IDC helpers |
 | Standalone CLI / GDB Server | `src/main.cpp` | `k0emu.exe` | Headless ROM runner with optional trace output or GDB RSP TCP server |
 | Test Suite | `tests/k0emu_tests.cpp` | `k0emu_tests.exe` | C++ unit and peripheral integration tests registered with CTest |
 | Headless IDA Test | `tests/ida_headless_test.py` | `build/ida_headless_report.json` | End-to-end verification under `idat.exe` against `sample_db.i64` |
@@ -31,7 +31,8 @@ The original Python reference implementation in `k0emu/` (`bus.py`, `system.py`,
 - **Peripherals (`Kx2` default profile & `Legacy0831` compatibility profile)**:
   - `Kx2Intc`: 29 Kx2 interrupt sources / 28 0831Y sources (`IF0L..IF1H`, `MK0L..MK1H`, `PR0L..PR1H`).
   - `Kx2Clock`: `OSCCTL`, `RCM`, `MCM`, `MOC`, `OSTC`, `OSTS`, `PCC`.
-  - `Kx2SystemCtrl`: `IMS`, `IXS`, `BANK`, `RESF`, `LVIM`, `LVIS`, `PFCMD`, `FLPMC`.
+  - `Kx2SystemCtrl`: `IMS`, `IXS`, `BANK`, `RESF`, `LVIM`, `LVIS`.
+  - `Kx2FlashCtrl`: Internal programmer mask ROM overlay (`PFCMD` `0xFFC0` = `0xA5` + `val`/`~val`/`val` write-protection on `FLPMC` `0xFFC4` & `FLREG` `0xFFCA`), two-stage mapping (`FLPMC.0` at `0x8000..0x9FFF`, `FLPMC.1` at `0x0000..0x1FFF`), `FLMD0` pin status (`FLPMC.2`), auto-derived product/flash-size register `PROD` (`0xFFF5`), and Extra Area (`0x800`-byte `EA.bin`) / main-flash read window (`0xFFC1`, `0xFFC5..0xFFCF`, rising edge on `0xFFC5.1` latching swapped halfwords at `0xF8F4..0xF8F5` and `0xF8F2..0xF8F3`).
   - `Kx2Wdt`: Option byte (`0x0080`) enable/interval configuration, `WDTE=0xAC` kick, overflow reset (`RESF.WDTRF`), plus legacy `WDCS`/`WDTM`.
   - `Kx2Ports`: `P*`/`PM*`/`PU*`, `EGP`/`EGN` (`INTP*` edge interrupts), `KRM`, `ISC`, `ADPC`.
   - Timers: `TM00`/`TM01` (16-bit), `TM50`/`TM51` (8-bit), `TMH0`/`TMH1` (8-bit H timers), `WTM` (Watch Timer).
@@ -56,6 +57,17 @@ Copy-Item -Force .\build\Release\k0dbg.dll "$env:APPDATA\Hex-Rays\IDA Pro\plugin
 
 `k0dbg.dll` activates automatically on NEC 78K0 databases (`PLFM_NEC_78K0` / `"78k0"`), auto-detects memory layout from IDB segments and device name (`"$ 78k0"`), loads initialized segments below `0xFF00`, and resets to the `[0x0000]` reset vector (or `start_ip` / `main` / `RESET`).
 
+### Programmer ROM & Extra Area Files (`78k0_programmer_fw.bin`, `EA.bin`)
+
+When starting or attaching a debug session in IDA Pro, `k0dbg.dll` automatically looks in **the same directory as `k0dbg.dll`** for:
+- `78k0_programmer_fw.bin` — 8 KB (`0x2000`) internal programmer mask ROM (or a 64 KB full dump whose `0x0000..0x1FFF` / `0x8000..0x9FFF` contains the 8 KB image).
+- `EA.bin` — `0x800`-byte (2048-byte) Extra Area flash image (addresses passed to firmware services such as `0x0790` are direct byte offsets into `EA.bin`).
+
+```powershell
+Copy-Item -Force .\78k0_programmer_fw.bin "$env:APPDATA\Hex-Rays\IDA Pro\plugins\78k0_programmer_fw.bin"
+Copy-Item -Force .\EA.bin "$env:APPDATA\Hex-Rays\IDA Pro\plugins\EA.bin"
+```
+
 ---
 
 ## Standalone CLI & GDB RSP Usage
@@ -64,6 +76,10 @@ Copy-Item -Force .\build\Release\k0dbg.dll "$env:APPDATA\Hex-Rays\IDA Pro\plugin
 Usage: k0emu [options]
 Options:
   --rom <path>           ROM binary to load at 0x0000
+  --prog-rom <path>      Programmer mask ROM binary (8 KB or 64 KB dump)
+  --ea <path>            Extra Area flash data binary (0x800 bytes)
+  --flmd0 <1|0|p23>      FLMD0 pin mode for FLPMC bit 2 (default: 1)
+  --product <hex>        Override product ID register 0xFFF5 (default: auto)
   --profile <kx2|0831y>  Hardware profile (default: kx2)
   --pc <addr>            Override initial PC (default: reset vector [0x0000])
   --sp <addr>            Override initial SP (default: 0x0000)
@@ -93,6 +109,11 @@ In IDA's debugger CLI bar (`k0emu`) or via `ida_dbg.send_dbg_command(...)` / GDB
 - `adc <ch> <val10>` — Set 10-bit ADC channel value
 - `uart6rx <hex|ascii>`, `uart6tx` — Inject UART6 RX byte / inspect TX buffer
 - `bank <n>` — Switch active flash memory bank (`0..5`)
+- `flash` — Inspect programmer ROM overlay, `FLPMC`/`FLCTL`/`FLREG`/`PROD`, and Extra Area read state
+- `load_prog <path>` — Load `78k0_programmer_fw.bin`
+- `load_ea <path>` — Load `EA.bin` (`0x800` bytes)
+- `flmd0 <1|0|p23>` — Configure `FLMD0` status pin (`FLPMC.2`)
+- `product <hex|auto>` — Override or auto-derive product ID register (`0xFFF5`)
 
 ### Registered IDC Functions
 
@@ -103,6 +124,7 @@ In IDA's debugger CLI bar (`k0emu`) or via `ida_dbg.send_dbg_command(...)` / GDB
 - `k0dbg_read_u16(addr)`, `k0dbg_write_u16(addr, val)`
 - `k0dbg_add_bpt(addr)`, `k0dbg_del_bpt(addr)`
 - `k0dbg_exec(cmd)`
+- `k0dbg_load_prog_rom(path)`, `k0dbg_load_ea(path)` (pass `""` to revert to `k0dbg.dll`'s directory defaults)
 
 ---
 

@@ -1,4 +1,5 @@
 #include "kx2_peripherals.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -224,7 +225,7 @@ void Kx2Clock::Reset() {
 
 uint8_t Kx2Clock::GetRcm() const {
     const bool rsts = (rcm_ & 0x01u) == 0;  // stabilized whenever RSTOP=0
-    return static_cast<uint8_t>((rcm_ & 0x03u) | (rsts ? 0x80u : 0x00u));
+    return static_cast<uint8_t>((rcm_ & 0x43u) | (rsts ? 0x80u : 0x00u));
 }
 
 uint8_t Kx2Clock::GetMcm() const {
@@ -281,14 +282,14 @@ void Kx2Clock::Write(uint16_t addr, uint8_t value) {
 void Kx2Clock::Poke(uint16_t addr, uint8_t value) {
     switch (addr) {
     case 0xFF9Fu: oscctl_ = value & 0xF1u; break;
-    case 0xFFA0u: rcm_ = (rcm_ & 0x80u) | (value & 0x03u); break;
+    case 0xFFA0u: rcm_ = (rcm_ & 0x80u) | (value & 0x43u); break;
     case 0xFFA1u: mcm_ = value & 0x05u; break;
     case 0xFFA2u:
         moc_ = value & 0x80u;
         UpdateOstc();
         break;
     case 0xFFA3u: break;  // OSTC is read-only
-    case 0xFFA4u: osts_ = value & 0x07u; break;
+    case 0xFFA4u: osts_ = value & 0x87u; break;
     case 0xFFFBu: pcc_ = value & 0x57u; break;
     default: break;
     }
@@ -363,8 +364,6 @@ void Kx2SystemCtrl::Reset() {
     ixs_ = 0x0Cu;
     lvim_ = 0x00u;
     lvis_ = 0x00u;
-    pfcmd_ = 0x00u;
-    flpmc_ = 0x00u;
     if (bus_) {
         bus_->SetActiveBank(0);
     }
@@ -384,8 +383,6 @@ uint8_t Kx2SystemCtrl::Peek(uint16_t addr) const {
     case 0xFFACu: return resf_;
     case 0xFFBEu: return lvim_;
     case 0xFFBFu: return lvis_;
-    case 0xFFC0u: return pfcmd_;
-    case 0xFFC4u: return flpmc_;
     case 0xFFF0u: return ims_;
     case 0xFFF3u: return bank_;
     case 0xFFF4u: return ixs_;
@@ -402,8 +399,6 @@ void Kx2SystemCtrl::Poke(uint16_t addr, uint8_t value) {
     case 0xFFACu: break;  // RESF is read-only
     case 0xFFBEu: lvim_ = (lvim_ & 0x01u) | (value & 0x86u); break;
     case 0xFFBFu: lvis_ = value & 0x0Fu; break;
-    case 0xFFC0u: pfcmd_ = value; break;
-    case 0xFFC4u: flpmc_ = value; break;
     case 0xFFF0u: ims_ = value; break;
     case 0xFFF3u:
         bank_ = value & 0x07u;
@@ -413,6 +408,222 @@ void Kx2SystemCtrl::Poke(uint16_t addr, uint8_t value) {
         break;
     case 0xFFF4u: ixs_ = value & 0x0Fu; break;
     default: break;
+    }
+}
+
+// ============================================================================
+// Kx2FlashCtrl (0xFFC0..0xFFCF, 0xFFF5, 0xF8F0..0xF8FF)
+// ============================================================================
+
+Kx2FlashCtrl::Kx2FlashCtrl(K0Bus *bus, Kx2Ports *ports)
+    : bus_(bus), ports_(ports) {
+    ea_data_.fill(0xFFu);
+    Reset();
+}
+
+void Kx2FlashCtrl::Reset() {
+    regs_.fill(0x00u);
+    buf_f8f0_.fill(0xFFu);
+    prot_stage_ = ProtectStage::Idle;
+    prot_target_ = 0;
+    prot_val_ = 0;
+    last_read_addr_ = 0;
+    last_read_is_ea_ = false;
+    read_count_ = 0;
+    warned_no_prog_rom_ = false;
+    if (bus_) {
+        bus_->SetProgrammerOverlay(false, false);
+    }
+}
+
+bool Kx2FlashCtrl::LoadEaBytes(const uint8_t *data, size_t size) {
+    if (!data && size > 0) {
+        return false;
+    }
+    ea_data_.fill(0xFFu);
+    if (size > 0) {
+        std::memcpy(ea_data_.data(), data, std::min(size, kEaSize));
+    }
+    ea_loaded_ = true;
+    return true;
+}
+
+void Kx2FlashCtrl::ClearEa() {
+    ea_data_.fill(0xFFu);
+    ea_loaded_ = false;
+}
+
+bool Kx2FlashCtrl::IsFlmd0High() const {
+    switch (flmd0_mode_) {
+    case Flmd0Mode::High: return true;
+    case Flmd0Mode::Low:  return false;
+    case Flmd0Mode::PinP23:
+        return ports_ ? ((ports_->GetPinState(2) & 0x08u) != 0) : false;
+    }
+    return true;
+}
+
+uint8_t Kx2FlashCtrl::DeriveProductId(uint32_t total_flash_bytes) {
+    if (total_flash_bytes <= 0x4000u) return 0x10u;
+    if (total_flash_bytes <= 0x6000u) return 0x20u;
+    if (total_flash_bytes <= 0x8000u) return 0x30u;
+    if (total_flash_bytes <= 0xC000u) return 0x40u;
+    if (total_flash_bytes <= 0xF000u) return 0x50u;
+    if (total_flash_bytes <= 0x18000u) return 0x60u;
+    return 0x70u;
+}
+
+uint8_t Kx2FlashCtrl::GetProductId() const {
+    if (product_override_ >= 0) {
+        return static_cast<uint8_t>(product_override_ & 0xFF);
+    }
+    const uint32_t flash_bytes = bus_ ? bus_->TotalFlashSize() : 0xC000u;
+    return DeriveProductId(flash_bytes);
+}
+
+void Kx2FlashCtrl::CommitFlpmc(uint8_t value) {
+    regs_[4] = value;
+    const bool ovl_hi = (value & 0x01u) != 0;
+    const bool ovl_lo = (value & 0x02u) != 0;
+    if ((ovl_hi || ovl_lo) && bus_ && !bus_->IsProgrammerRomLoaded() && !warned_no_prog_rom_) {
+        warned_no_prog_rom_ = true;
+        LOG("Warning: FLPMC (0x%02X) enabled programmer ROM overlay, but 78k0_programmer_fw.bin is not loaded.",
+            static_cast<unsigned>(value));
+    }
+    if (bus_) {
+        bus_->SetProgrammerOverlay(ovl_hi, ovl_lo);
+    }
+}
+
+void Kx2FlashCtrl::LatchReadWord() {
+    const uint32_t addr = GetCurrentAddressReg();
+    const bool is_ea = (regs_[0x0Au] & 0x01u) != 0;
+
+    uint8_t b[4] = { 0xFFu, 0xFFu, 0xFFu, 0xFFu };
+    for (uint32_t i = 0; i < 4u; ++i) {
+        if (is_ea) {
+            b[i] = ReadEaByte(addr + i);
+        } else if (bus_) {
+            b[i] = bus_->ReadMainFlashByte(addr + i);
+        }
+    }
+
+    // Return window uses swapped halfwords: 0xF8F4..0xF8F5 = [addr+0..+1], 0xF8F2..0xF8F3 = [addr+2..+3].
+    buf_f8f0_[4] = b[0];
+    buf_f8f0_[5] = b[1];
+    buf_f8f0_[2] = b[2];
+    buf_f8f0_[3] = b[3];
+
+    last_read_addr_ = addr;
+    last_read_is_ea_ = is_ea;
+    ++read_count_;
+}
+
+uint8_t Kx2FlashCtrl::Read(uint16_t addr) {
+    return Peek(addr);
+}
+
+uint8_t Kx2FlashCtrl::Peek(uint16_t addr) const {
+    if (addr == 0xFFC4u) {
+        return static_cast<uint8_t>((regs_[4] & ~0x04u) | (IsFlmd0High() ? 0x04u : 0x00u));
+    }
+    if (addr >= 0xFFC0u && addr <= 0xFFCFu) {
+        return regs_[addr - 0xFFC0u];
+    }
+    if (addr == 0xFFF5u) {
+        return GetProductId();
+    }
+    if (addr >= K0Bus::kFlashBufStart && addr <= K0Bus::kFlashBufEnd) {
+        return buf_f8f0_[addr - K0Bus::kFlashBufStart];
+    }
+    return 0;
+}
+
+void Kx2FlashCtrl::Write(uint16_t addr, uint8_t value) {
+    if (addr == 0xFFC0u) {
+        regs_[0] = value;
+        prot_stage_ = (value == 0xA5u) ? ProtectStage::Armed : ProtectStage::Idle;
+        return;
+    }
+
+    if (addr == 0xFFC4u || addr == 0xFFCAu) {
+        switch (prot_stage_) {
+        case ProtectStage::Armed:
+            prot_target_ = addr;
+            prot_val_ = value;
+            prot_stage_ = ProtectStage::GotVal;
+            break;
+        case ProtectStage::GotVal:
+            if (addr == prot_target_ && value == static_cast<uint8_t>(~prot_val_)) {
+                prot_stage_ = ProtectStage::GotInv;
+            } else {
+                prot_stage_ = ProtectStage::Idle;
+            }
+            break;
+        case ProtectStage::GotInv:
+            prot_stage_ = ProtectStage::Idle;
+            if (addr == prot_target_ && value == prot_val_) {
+                if (addr == 0xFFC4u) {
+                    CommitFlpmc(prot_val_);
+                } else {
+                    regs_[0x0Au] = prot_val_;
+                }
+            }
+            break;
+        case ProtectStage::Idle:
+        default:
+            prot_stage_ = ProtectStage::Idle;
+            break;
+        }
+        return;
+    }
+
+    prot_stage_ = ProtectStage::Idle;
+
+    if (addr == 0xFFC5u) {
+        const uint8_t prev = regs_[5];
+        regs_[5] = value;
+        const bool rising_bit1 = (prev & 0x02u) == 0 && (value & 0x02u) != 0;
+        const bool read_mode = (regs_[7] & 0x01u) == 0 && regs_[1] == 0x80u;
+        if (rising_bit1 && read_mode) {
+            LatchReadWord();
+        }
+        return;
+    }
+
+    if (addr >= 0xFFC1u && addr <= 0xFFCFu) {
+        regs_[addr - 0xFFC0u] = value;
+        return;
+    }
+
+    if (addr == 0xFFF5u) {
+        return;  // 0xFFF5 is read-only for the CPU
+    }
+
+    if (addr >= K0Bus::kFlashBufStart && addr <= K0Bus::kFlashBufEnd) {
+        buf_f8f0_[addr - K0Bus::kFlashBufStart] = value;
+    }
+}
+
+void Kx2FlashCtrl::Poke(uint16_t addr, uint8_t value) {
+    if (addr == 0xFFC4u) {
+        CommitFlpmc(value);
+        return;
+    }
+    if (addr == 0xFFCAu) {
+        regs_[0x0Au] = value;
+        return;
+    }
+    if (addr == 0xFFF5u) {
+        product_override_ = value;
+        return;
+    }
+    if (addr >= 0xFFC0u && addr <= 0xFFCFu) {
+        regs_[addr - 0xFFC0u] = value;
+        return;
+    }
+    if (addr >= K0Bus::kFlashBufStart && addr <= K0Bus::kFlashBufEnd) {
+        buf_f8f0_[addr - K0Bus::kFlashBufStart] = value;
     }
 }
 

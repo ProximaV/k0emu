@@ -101,7 +101,7 @@ private:
 };
 
 // ============================================================================
-// System Control / Memory Bank / Reset Flag / LVI (0xFFAC, FFBE, FFBF, FFC0, FFC4, FFF0, FFF3, FFF4)
+// System Control / Memory Bank / Reset Flag / LVI (0xFFAC, FFBE, FFBF, FFF0, FFF3, FFF4)
 // ============================================================================
 
 class Kx2SystemCtrl final : public PeripheralDevice {
@@ -131,8 +131,86 @@ private:
     uint8_t resf_ = 0x00u;
     uint8_t lvim_ = 0x00u;
     uint8_t lvis_ = 0x00u;
-    uint8_t pfcmd_ = 0x00u;
-    uint8_t flpmc_ = 0x00u;
+};
+
+class Kx2Ports;
+
+// ============================================================================
+// Flash & Programmer ROM Controller (0xFFC0..0xFFCF, 0xFFF5, 0xF8F0..0xF8FF)
+// ============================================================================
+
+class Kx2FlashCtrl final : public PeripheralDevice {
+public:
+    static constexpr size_t kEaSize = 0x800u;
+
+    enum class Flmd0Mode : uint8_t {
+        High   = 0,
+        Low    = 1,
+        PinP23 = 2,
+    };
+
+    Kx2FlashCtrl(K0Bus *bus, Kx2Ports *ports);
+
+    uint8_t Read(uint16_t addr) override;
+    void Write(uint16_t addr, uint8_t value) override;
+    uint8_t Peek(uint16_t addr) const override;
+    void Poke(uint16_t addr, uint8_t value) override;
+    void Reset() override;
+
+    bool LoadEaBytes(const uint8_t *data, size_t size);
+    void ClearEa();
+    bool IsEaLoaded() const { return ea_loaded_; }
+    uint8_t ReadEaByte(uint32_t offset) const {
+        return (offset < kEaSize) ? ea_data_[offset] : 0xFFu;
+    }
+
+    void SetFlmd0Mode(Flmd0Mode mode) { flmd0_mode_ = mode; }
+    Flmd0Mode GetFlmd0Mode() const { return flmd0_mode_; }
+    bool IsFlmd0High() const;
+
+    static uint8_t DeriveProductId(uint32_t total_flash_bytes);
+    void SetProductOverride(int16_t val) { product_override_ = val; }
+    int16_t GetProductOverride() const { return product_override_; }
+    uint8_t GetProductId() const;
+
+    uint32_t GetCurrentAddressReg() const {
+        return (static_cast<uint32_t>(regs_[6]) << 16) |
+               (static_cast<uint32_t>(regs_[9]) << 8) |
+               static_cast<uint32_t>(regs_[8]);
+    }
+    uint32_t GetLastReadAddr() const { return last_read_addr_; }
+    bool LastReadWasEa() const { return last_read_is_ea_; }
+    uint64_t GetReadCount() const { return read_count_; }
+
+private:
+    enum class ProtectStage : uint8_t {
+        Idle   = 0,
+        Armed  = 1,
+        GotVal = 2,
+        GotInv = 3,
+    };
+
+    void CommitFlpmc(uint8_t value);
+    void LatchReadWord();
+
+    K0Bus *bus_ = nullptr;
+    Kx2Ports *ports_ = nullptr;
+
+    std::array<uint8_t, 16> regs_{};      // 0xFFC0..0xFFCF
+    std::array<uint8_t, 16> buf_f8f0_{};  // 0xF8F0..0xF8FF
+    std::array<uint8_t, kEaSize> ea_data_{};
+    bool ea_loaded_ = false;
+    Flmd0Mode flmd0_mode_ = Flmd0Mode::High;
+    int16_t product_override_ = -1;
+
+    ProtectStage prot_stage_ = ProtectStage::Idle;
+    uint16_t prot_target_ = 0;
+    uint8_t prot_val_ = 0;
+
+    uint32_t last_read_addr_ = 0;
+    bool last_read_is_ea_ = false;
+    uint64_t read_count_ = 0;
+    bool warned_no_prog_rom_ = false;
 };
 
 // ============================================================================

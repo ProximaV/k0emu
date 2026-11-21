@@ -37,6 +37,65 @@ const char *RunStateName(RunState st) {
     return "?";
 }
 
+bool EqIgnoreCase(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) !=
+            std::tolower(static_cast<unsigned char>(*b))) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+const char *Flmd0ModeName(Kx2FlashCtrl::Flmd0Mode mode) {
+    switch (mode) {
+    case Kx2FlashCtrl::Flmd0Mode::High:   return "high";
+    case Kx2FlashCtrl::Flmd0Mode::Low:    return "low";
+    case Kx2FlashCtrl::Flmd0Mode::PinP23: return "p23";
+    }
+    return "?";
+}
+
+std::string ExtractTrailingArg(const std::string &trimmed, size_t cmd_len) {
+    if (trimmed.size() <= cmd_len) {
+        return std::string();
+    }
+    std::string arg = Trim(trimmed.substr(cmd_len));
+    if (arg.size() >= 2 &&
+        ((arg.front() == '"' && arg.back() == '"') ||
+         (arg.front() == '\'' && arg.back() == '\''))) {
+        arg = arg.substr(1, arg.size() - 2);
+    }
+    return arg;
+}
+
+bool ReadBinaryFile(const char *path, std::vector<uint8_t> *out) {
+    if (!path || !*path || !out) return false;
+    std::FILE *fp = std::fopen(path, "rb");
+    if (!fp) return false;
+    std::fseek(fp, 0, SEEK_END);
+    const long fsz = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (fsz < 0) {
+        std::fclose(fp);
+        return false;
+    }
+    out->resize(static_cast<size_t>(fsz));
+    if (fsz > 0) {
+        const size_t nread = std::fread(out->data(), 1, out->size(), fp);
+        if (nread != out->size()) {
+            std::fclose(fp);
+            out->clear();
+            return false;
+        }
+    }
+    std::fclose(fp);
+    return true;
+}
+
 }  // namespace
 
 K0Machine::K0Machine()
@@ -57,7 +116,8 @@ K0Machine::K0Machine()
       csi10(0, MachineProfile::Kx2, &intc, 10),
       csi11(1, MachineProfile::Kx2, &intc, 25),
       iic0(MachineProfile::Kx2, &intc, 24),
-      muldiv(&intc, 24) {
+      muldiv(&intc, 24),
+      flash(&bus, &ports) {
     Configure(MachineProfile::Kx2, 0xC000u, 0xF400u, 0xF800u, K0Bus::kHighSpeedRamStart);
 }
 
@@ -174,13 +234,17 @@ void K0Machine::WirePeripherals() {
     // IIC0
     bus.MapSfrRange(0xFFA5u, 0xFFABu, &iic0);
 
-    // System Control / Memory Bank / Reset / LVI / Self-prog
+    // System Control / Memory Bank / Reset / LVI
     bus.MapSfr(0xFFACu, &sysctrl);
-    bus.MapSfrRange(0xFFBEu, 0xFFC0u, &sysctrl);
-    bus.MapSfr(0xFFC4u, &sysctrl);
+    bus.MapSfrRange(0xFFBEu, 0xFFBFu, &sysctrl);
     bus.MapSfr(0xFFF0u, &sysctrl);
     bus.MapSfr(0xFFF3u, &sysctrl);
     bus.MapSfr(0xFFF4u, &sysctrl);
+
+    // Internal Flash & Programmer ROM Controller
+    bus.MapSfrRange(0xFFC0u, 0xFFCFu, &flash);
+    bus.MapSfr(0xFFF5u, &flash);
+    bus.MapFlashBuf(&flash);
 }
 
 void K0Machine::Reset(int32_t entry_override) {
@@ -198,26 +262,46 @@ bool K0Machine::LoadRomBytes(const uint8_t *data, size_t size, uint16_t base_add
 }
 
 bool K0Machine::LoadRomFile(const char *path, uint16_t base_addr) {
-    if (!path || !*path) return false;
-    std::FILE *fp = std::fopen(path, "rb");
-    if (!fp) return false;
-    std::fseek(fp, 0, SEEK_END);
-    const long fsz = std::ftell(fp);
-    std::fseek(fp, 0, SEEK_SET);
-    if (fsz < 0) {
-        std::fclose(fp);
-        return false;
-    }
-    std::vector<uint8_t> buf(static_cast<size_t>(fsz));
-    if (fsz > 0) {
-        const size_t nread = std::fread(buf.data(), 1, buf.size(), fp);
-        if (nread != buf.size()) {
-            std::fclose(fp);
-            return false;
-        }
-    }
-    std::fclose(fp);
+    std::vector<uint8_t> buf;
+    if (!ReadBinaryFile(path, &buf)) return false;
     return bus.LoadRom(buf.data(), buf.size(), base_addr);
+}
+
+bool K0Machine::LoadProgrammerRomBytes(const uint8_t *data, size_t size) {
+    return bus.LoadProgrammerRom(data, size);
+}
+
+bool K0Machine::LoadProgrammerRomFile(const char *path) {
+    std::vector<uint8_t> buf;
+    if (!ReadBinaryFile(path, &buf) || buf.empty()) return false;
+    return bus.LoadProgrammerRom(buf.data(), buf.size());
+}
+
+bool K0Machine::LoadEaBytes(const uint8_t *data, size_t size) {
+    return flash.LoadEaBytes(data, size);
+}
+
+bool K0Machine::LoadEaFile(const char *path) {
+    std::vector<uint8_t> buf;
+    if (!ReadBinaryFile(path, &buf)) return false;
+    return flash.LoadEaBytes(buf.data(), buf.size());
+}
+
+bool K0Machine::ParseFlmd0Mode(const char *arg, Kx2FlashCtrl::Flmd0Mode *out) {
+    if (!arg || !out) return false;
+    if (EqIgnoreCase(arg, "1") || EqIgnoreCase(arg, "high") || EqIgnoreCase(arg, "true")) {
+        *out = Kx2FlashCtrl::Flmd0Mode::High;
+        return true;
+    }
+    if (EqIgnoreCase(arg, "0") || EqIgnoreCase(arg, "low") || EqIgnoreCase(arg, "false")) {
+        *out = Kx2FlashCtrl::Flmd0Mode::Low;
+        return true;
+    }
+    if (EqIgnoreCase(arg, "p23") || EqIgnoreCase(arg, "p2.3") || EqIgnoreCase(arg, "auto")) {
+        *out = Kx2FlashCtrl::Flmd0Mode::PinP23;
+        return true;
+    }
+    return false;
 }
 
 StopInfo K0Machine::Step(bool ignore_bpt_at_pc) {
@@ -330,6 +414,34 @@ std::string K0Machine::FormatPorts() const {
     return out;
 }
 
+std::string K0Machine::FormatFlash() const {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "ProgROM=%s overlay=%s (8000:%d 0000:%d) | EA=%s (0x%04zX bytes)\n"
+        "PROD(FFF5)=%02X (flash=%uB%s) FLMD0=%d (mode=%s)\n"
+        "PFCMD=%02X FLM0=%02X FLPMC=%02X FLCTL=%02X FLSTS=%02X FLREG=%02X\n"
+        "FLADR=%06X DataBuf[F8F4..F5,F2..F3]=%02X %02X %02X %02X (reads=%llu last=%s@%06X)",
+        bus.IsProgrammerRomLoaded() ? "loaded" : "none",
+        bus.GetProgOverlayMask() ? "ON" : "off",
+        bus.IsProgOverlayHigh() ? 1 : 0,
+        bus.IsProgOverlayLow() ? 1 : 0,
+        flash.IsEaLoaded() ? "loaded" : "default(0xFF)",
+        Kx2FlashCtrl::kEaSize,
+        flash.GetProductId(),
+        bus.TotalFlashSize(),
+        (flash.GetProductOverride() >= 0) ? ", override" : ", auto",
+        flash.IsFlmd0High() ? 1 : 0,
+        Flmd0ModeName(flash.GetFlmd0Mode()),
+        flash.Peek(0xFFC0u), flash.Peek(0xFFC1u), flash.Peek(0xFFC4u),
+        flash.Peek(0xFFC5u), flash.Peek(0xFFC7u), flash.Peek(0xFFCAu),
+        flash.GetCurrentAddressReg(),
+        flash.Peek(0xF8F4u), flash.Peek(0xF8F5u), flash.Peek(0xF8F2u), flash.Peek(0xF8F3u),
+        static_cast<unsigned long long>(flash.GetReadCount()),
+        flash.LastReadWasEa() ? "EA" : "MAIN",
+        flash.GetLastReadAddr());
+    return buf;
+}
+
 std::string K0Machine::FormatMemoryMap() const {
     std::string out;
     char buf[128];
@@ -368,6 +480,11 @@ bool K0Machine::ExecuteCommand(const std::string &cmdline, std::string &out) {
             "  uart6rx <hex|ascii>   - Inject RX byte into UART6\n"
             "  uart6tx               - Dump UART6 TX log\n"
             "  bank <n>              - Switch active flash memory bank (0..5)\n"
+            "  flash                 - Print programmer ROM overlay & EA flash controller state\n"
+            "  load_prog <path>      - Load 78k0_programmer_fw.bin (8 KB or 64 KB)\n"
+            "  load_ea <path>        - Load EA.bin (0x800 bytes)\n"
+            "  flmd0 <1|0|p23>       - Configure FLMD0 pin state (FLPMC.2)\n"
+            "  product <hex|auto>    - Set or auto-derive product ID register (0xFFF5)\n"
             "  disasm [addr] [count] - Disassemble instructions (default PC, 10)\n"
             "  map                   - Print memory map\n"
             "  step [n]              - Execute n instructions (default 1)\n";
@@ -456,6 +573,52 @@ bool K0Machine::ExecuteCommand(const std::string &cmdline, std::string &out) {
         const uint8_t b = static_cast<uint8_t>(std::strtoul(args[1].c_str(), nullptr, 0)) & 7u;
         sysctrl.Poke(0xFFF3u, b);
         std::snprintf(buf, sizeof(buf), "[k0emu] Active ROM bank = %u", bus.GetActiveBank());
+        out = buf;
+        return true;
+    }
+    if (cmd == "flash") {
+        out = FormatFlash();
+        return true;
+    }
+    if (cmd == "load_prog") {
+        const std::string path = ExtractTrailingArg(trimmed, cmd.size());
+        if (path.empty() || !LoadProgrammerRomFile(path.c_str())) {
+            out = "[k0emu] Failed to load programmer ROM image.";
+            return false;
+        }
+        out = "[k0emu] Loaded programmer ROM (8192 bytes).";
+        return true;
+    }
+    if (cmd == "load_ea") {
+        const std::string path = ExtractTrailingArg(trimmed, cmd.size());
+        if (path.empty() || !LoadEaFile(path.c_str())) {
+            out = "[k0emu] Failed to load Extra Area image.";
+            return false;
+        }
+        std::snprintf(buf, sizeof(buf), "[k0emu] Loaded Extra Area (%zu bytes).", Kx2FlashCtrl::kEaSize);
+        out = buf;
+        return true;
+    }
+    if (cmd == "flmd0" && args.size() >= 2) {
+        Kx2FlashCtrl::Flmd0Mode mode = Kx2FlashCtrl::Flmd0Mode::High;
+        if (!ParseFlmd0Mode(args[1].c_str(), &mode)) {
+            out = "[k0emu] Invalid flmd0 mode (use 1|high, 0|low, or p23).";
+            return false;
+        }
+        flash.SetFlmd0Mode(mode);
+        std::snprintf(buf, sizeof(buf), "[k0emu] FLMD0 mode = %s (bit2=%d)",
+                      Flmd0ModeName(mode), flash.IsFlmd0High() ? 1 : 0);
+        out = buf;
+        return true;
+    }
+    if (cmd == "product" && args.size() >= 2) {
+        if (EqIgnoreCase(args[1].c_str(), "auto")) {
+            flash.SetProductOverride(-1);
+        } else {
+            const uint8_t val = static_cast<uint8_t>(std::strtoul(args[1].c_str(), nullptr, 0) & 0xFFu);
+            flash.SetProductOverride(val);
+        }
+        std::snprintf(buf, sizeof(buf), "[k0emu] PROD (0xFFF5) = 0x%02X", flash.GetProductId());
         out = buf;
         return true;
     }

@@ -75,6 +75,11 @@ public:
     static constexpr uint16_t kBankWindowEnd     = 0xBFFFu;
     static constexpr uint32_t kBankSize          = 0x4000u;
     static constexpr uint8_t  kMaxBanks          = 6u;
+    static constexpr uint16_t kProgRomSize       = 0x2000u;
+    static constexpr uint16_t kProgRomLowStart   = 0x0000u;
+    static constexpr uint16_t kProgRomHighStart  = 0x8000u;
+    static constexpr uint16_t kFlashBufStart     = 0xF8F0u;
+    static constexpr uint16_t kFlashBufEnd       = 0xF8FFu;
 
     K0Bus();
 
@@ -91,9 +96,25 @@ public:
     void RegisterDevice(PeripheralDevice *dev);
     void MapSfr(uint16_t addr, PeripheralDevice *dev);
     void MapSfrRange(uint16_t start_addr, uint16_t end_addr, PeripheralDevice *dev);
+    void MapFlashBuf(PeripheralDevice *dev);
 
     // Load flat firmware image into ROM (supports <= 60 KB unbanked or 96/128 KB banked images).
     bool LoadRom(const uint8_t *data, size_t size, uint16_t base_addr = 0);
+
+    // Load 8 KB internal programmer mask ROM (accepts 8 KB or full 64 KB dump).
+    bool LoadProgrammerRom(const uint8_t *data, size_t size);
+    void ClearProgrammerRom();
+    void SetProgrammerOverlay(bool overlay_high_8000, bool overlay_low_0000);
+    bool IsProgrammerRomLoaded() const { return prog_rom_loaded_; }
+    bool IsProgOverlayHigh() const { return prog_overlay_high_; }
+    bool IsProgOverlayLow() const { return prog_overlay_low_; }
+    uint8_t GetProgOverlayMask() const {
+        return static_cast<uint8_t>((prog_overlay_high_ ? 1u : 0u) | (prog_overlay_low_ ? 2u : 0u));
+    }
+
+    // Read user flash array directly, bypassing programmer ROM overlays (supports up to 128 KB).
+    uint8_t ReadMainFlashByte(uint32_t addr) const;
+    uint32_t TotalFlashSize() const;
 
     // High-speed internal RAM rule: 0xFB00..0xFEFF (1 bus clock vs 2 clocks elsewhere).
     bool IsHighSpeed(uint16_t addr) const {
@@ -158,7 +179,15 @@ public:
 
 private:
     bool IsRomAddr(uint16_t addr) const { return addr < rom_end_; }
+    bool IsProgRomOverlaid(uint16_t addr) const {
+        return prog_rom_loaded_ &&
+               ((prog_overlay_high_ && addr >= kProgRomHighStart &&
+                 addr < static_cast<uint16_t>(kProgRomHighStart + kProgRomSize)) ||
+                (prog_overlay_low_ && addr < kProgRomSize));
+    }
+    uint8_t ReadProgRomByte(uint16_t addr) const { return prog_rom_[addr & 0x1FFFu]; }
     bool IsExpRamAddr(uint16_t addr) const { return exp_ram_end_ > exp_ram_start_ && addr >= exp_ram_start_ && addr < exp_ram_end_; }
+    bool IsFlashBufAddr(uint16_t addr) const { return flash_buf_dev_ != nullptr && addr >= kFlashBufStart && addr <= kFlashBufEnd; }
     bool IsHighSpeedRamAddr(uint16_t addr) const { return addr >= ram_start_ && addr <= kHighSpeedRamEnd; }
     bool IsGprAddr(uint16_t addr) const { return addr >= kGprStart && addr <= kGprEnd; }
     bool IsSfrAddr(uint16_t addr) const { return addr >= kSfrStart; }
@@ -177,6 +206,10 @@ private:
 
     std::array<uint8_t, 0xF000u> rom_common_{};
     std::array<std::array<uint8_t, kBankSize>, kMaxBanks> rom_banks_{};
+    std::array<uint8_t, kProgRomSize> prog_rom_{};
+    bool prog_rom_loaded_ = false;
+    bool prog_overlay_high_ = false;
+    bool prog_overlay_low_ = false;
     uint8_t active_bank_ = 0;
     uint8_t bank_count_ = 0;  // 0 = unbanked, >0 = number of 16KB banks active at 0x8000..0xBFFF
 
@@ -185,6 +218,7 @@ private:
     std::array<uint8_t, 0x0020u> gpr_ram_{};
     std::array<uint8_t, 0x0100u> sfr_ram_{};
 
+    PeripheralDevice *flash_buf_dev_ = nullptr;
     std::array<PeripheralDevice *, 256> sfr_devs_{};
     std::vector<PeripheralDevice *> devices_;
     std::vector<Watchpoint> watchpoints_;

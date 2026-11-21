@@ -14,6 +14,10 @@ void PrintUsage(const char *prog) {
         "Usage: %s [options]\n"
         "Options:\n"
         "  --rom <path>           ROM binary to load at 0x0000\n"
+        "  --prog-rom <path>      Programmer mask ROM binary (8 KB or 64 KB dump)\n"
+        "  --ea <path>            Extra Area flash data binary (0x800 bytes)\n"
+        "  --flmd0 <1|0|p23>      FLMD0 pin mode for FLPMC bit 2 (default: 1)\n"
+        "  --product <hex>        Override product ID register 0xFFF5 (default: auto)\n"
         "  --profile <kx2|0831y>  Hardware profile (default: kx2)\n"
         "  --pc <addr>            Override initial PC (default: reset vector [0x0000])\n"
         "  --sp <addr>            Override initial SP (default: 0x0000)\n"
@@ -48,6 +52,10 @@ int main(int argc, char *argv[]) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     std::string rom_path;
+    std::string prog_rom_path;
+    std::string ea_path;
+    k0::Kx2FlashCtrl::Flmd0Mode flmd0_mode = k0::Kx2FlashCtrl::Flmd0Mode::High;
+    int16_t product_override = -1;
     MachineProfile profile = MachineProfile::Kx2;
     int32_t pc_override = -1;
     int32_t sp_override = -1;
@@ -65,6 +73,22 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if (std::strcmp(arg, "--rom") == 0 && i + 1 < argc) {
             rom_path = argv[++i];
+        } else if (std::strcmp(arg, "--prog-rom") == 0 && i + 1 < argc) {
+            prog_rom_path = argv[++i];
+        } else if (std::strcmp(arg, "--ea") == 0 && i + 1 < argc) {
+            ea_path = argv[++i];
+        } else if (std::strcmp(arg, "--flmd0") == 0 && i + 1 < argc) {
+            if (!k0::K0Machine::ParseFlmd0Mode(argv[++i], &flmd0_mode)) {
+                std::fprintf(stderr, "Invalid --flmd0 mode (expected 1|0|p23)\n");
+                return 1;
+            }
+        } else if (std::strcmp(arg, "--product") == 0 && i + 1 < argc) {
+            const char *pv = argv[++i];
+            if (std::strcmp(pv, "auto") == 0) {
+                product_override = -1;
+            } else {
+                product_override = static_cast<int16_t>(std::strtoul(pv, nullptr, 0) & 0xFFu);
+            }
         } else if (std::strcmp(arg, "--profile") == 0 && i + 1 < argc) {
             const char *p = argv[++i];
             if (std::strcmp(p, "0831y") == 0 || std::strcmp(p, "0831") == 0) {
@@ -119,6 +143,17 @@ int main(int argc, char *argv[]) {
         PrintUsage(argv[0]);
         return 1;
     }
+
+    if (!prog_rom_path.empty() && !machine.LoadProgrammerRomFile(prog_rom_path.c_str())) {
+        std::fprintf(stderr, "Failed to load programmer ROM image: %s\n", prog_rom_path.c_str());
+        return 1;
+    }
+    if (!ea_path.empty() && !machine.LoadEaFile(ea_path.c_str())) {
+        std::fprintf(stderr, "Failed to load Extra Area image: %s\n", ea_path.c_str());
+        return 1;
+    }
+    machine.flash.SetFlmd0Mode(flmd0_mode);
+    machine.flash.SetProductOverride(product_override);
 
     machine.Reset(pc_override);
     if (sp_override >= 0) {

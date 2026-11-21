@@ -246,7 +246,14 @@ const char *LookupSfrName(uint16_t addr, MachineProfile profile) {
     case 0xFFBEu: return "LVIM";
     case 0xFFBFu: return "LVIS";
     case 0xFFC0u: return "PFCMD";
+    case 0xFFC1u: return "FLM0";
     case 0xFFC4u: return "FLPMC";
+    case 0xFFC5u: return "FLCTL";
+    case 0xFFC6u: return "FLADRH";
+    case 0xFFC7u: return "FLSTS";
+    case 0xFFC8u: return "FLADRL";
+    case 0xFFC9u: return "FLADRM";
+    case 0xFFCAu: return "FLREG";
     case 0xFFE0u: return "IF0L";
     case 0xFFE1u: return "IF0H";
     case 0xFFE2u: return "IF1L";
@@ -262,6 +269,7 @@ const char *LookupSfrName(uint16_t addr, MachineProfile profile) {
     case 0xFFF0u: return "IMS";
     case 0xFFF3u: return "BANK";
     case 0xFFF4u: return "IXS";
+    case 0xFFF5u: return "PROD";
     case 0xFFFBu: return "PCC";
     default: return nullptr;
     }

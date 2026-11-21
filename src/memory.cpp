@@ -4,6 +4,7 @@
 #include <cstring>
 
 K0Bus::K0Bus() {
+    prog_rom_.fill(0xFFu);
     ConfigureLayout(MachineProfile::Kx2, 0xC000u, 0xF400u, 0xF800u, kHighSpeedRamStart);
     ClearMemory();
 }
@@ -35,6 +36,8 @@ void K0Bus::ClearMemory() {
     }
     active_bank_ = 0;
     bank_count_ = 0;
+    prog_overlay_high_ = false;
+    prog_overlay_low_ = false;
     exp_ram_.fill(0);
     high_speed_ram_.fill(0);
     gpr_ram_.fill(0);
@@ -43,12 +46,15 @@ void K0Bus::ClearMemory() {
 }
 
 void K0Bus::ClearAllDevices() {
+    flash_buf_dev_ = nullptr;
     sfr_devs_.fill(nullptr);
     devices_.clear();
 }
 
 void K0Bus::ResetDevices() {
     active_bank_ = 0;
+    prog_overlay_high_ = false;
+    prog_overlay_low_ = false;
     sfr_ram_.fill(0);
     for (PeripheralDevice *dev : devices_) {
         if (dev) {
@@ -82,6 +88,11 @@ void K0Bus::MapSfrRange(uint16_t start_addr, uint16_t end_addr, PeripheralDevice
     for (uint32_t a = start_addr; a <= end_addr; ++a) {
         sfr_devs_[a - kSfrStart] = dev;
     }
+}
+
+void K0Bus::MapFlashBuf(PeripheralDevice *dev) {
+    RegisterDevice(dev);
+    flash_buf_dev_ = dev;
 }
 
 bool K0Bus::LoadRom(const uint8_t *data, size_t size, uint16_t base_addr) {
@@ -137,6 +148,65 @@ void K0Bus::SetActiveBank(uint8_t bank) {
     }
 }
 
+bool K0Bus::LoadProgrammerRom(const uint8_t *data, size_t size) {
+    if (!data || size == 0) {
+        return false;
+    }
+    prog_rom_.fill(0xFFu);
+    if (size <= kProgRomSize) {
+        std::memcpy(prog_rom_.data(), data, size);
+    } else {
+        bool has_low = false;
+        for (size_t i = 0; i < kProgRomSize; ++i) {
+            if (data[i] != 0xFFu) {
+                has_low = true;
+                break;
+            }
+        }
+        if (has_low || size < static_cast<size_t>(kProgRomHighStart) + kProgRomSize) {
+            std::memcpy(prog_rom_.data(), data, kProgRomSize);
+        } else {
+            std::memcpy(prog_rom_.data(), data + kProgRomHighStart, kProgRomSize);
+        }
+    }
+    prog_rom_loaded_ = true;
+    return true;
+}
+
+void K0Bus::ClearProgrammerRom() {
+    prog_rom_.fill(0xFFu);
+    prog_rom_loaded_ = false;
+    prog_overlay_high_ = false;
+    prog_overlay_low_ = false;
+}
+
+void K0Bus::SetProgrammerOverlay(bool overlay_high_8000, bool overlay_low_0000) {
+    prog_overlay_high_ = overlay_high_8000;
+    prog_overlay_low_ = overlay_low_0000;
+}
+
+uint8_t K0Bus::ReadMainFlashByte(uint32_t addr) const {
+    if (bank_count_ > 0) {
+        if (addr < kBankWindowStart) {
+            return rom_common_[addr];
+        }
+        const uint32_t rel = addr - kBankWindowStart;
+        const uint32_t bank = rel / kBankSize;
+        if (bank < bank_count_) {
+            return rom_banks_[bank][rel % kBankSize];
+        }
+        return 0xFFu;
+    }
+    return (addr < rom_end_) ? rom_common_[addr] : 0xFFu;
+}
+
+uint32_t K0Bus::TotalFlashSize() const {
+    if (bank_count_ > 0) {
+        return static_cast<uint32_t>(kBankWindowStart) + static_cast<uint32_t>(bank_count_) * kBankSize;
+    }
+    return static_cast<uint32_t>(rom_end_);
+}
+
 uint8_t K0Bus::ReadRomByte(uint16_t addr) const {
     if (bank_count_ > 0 && addr >= kBankWindowStart && addr <= kBankWindowEnd) {
         const uint8_t b = (active_bank_ < bank_count_) ? active_bank_ : 0u;
@@ -155,7 +225,8 @@ void K0Bus::WriteRomByte(uint16_t addr, uint8_t value) {
 }
 
 bool K0Bus::IsMappedAddr(uint16_t addr) const {
-    return IsRomAddr(addr) || IsExpRamAddr(addr) || IsHighSpeedRamAddr(addr) || IsGprAddr(addr) || IsSfrAddr(addr);
+    return IsProgRomOverlaid(addr) || IsRomAddr(addr) || IsExpRamAddr(addr) ||
+           IsFlashBufAddr(addr) || IsHighSpeedRamAddr(addr) || IsGprAddr(addr) || IsSfrAddr(addr);
 }
 
 void K0Bus::CheckWatchpoints(uint16_t addr, bool is_write) {
@@ -176,6 +247,9 @@ void K0Bus::CheckWatchpoints(uint16_t addr, bool is_write) {
 }
 
 uint8_t K0Bus::FetchByte(uint16_t pc) {
+    if (IsProgRomOverlaid(pc)) {
+        return ReadProgRomByte(pc);
+    }
     if (IsRomAddr(pc)) {
         return ReadRomByte(pc);
     }
@@ -198,11 +272,17 @@ uint8_t K0Bus::FetchByte(uint16_t pc) {
 
 uint8_t K0Bus::ReadCpu(uint16_t addr) {
     CheckWatchpoints(addr, false);
+    if (IsProgRomOverlaid(addr)) {
+        return ReadProgRomByte(addr);
+    }
     if (IsRomAddr(addr)) {
         return ReadRomByte(addr);
     }
     if (IsExpRamAddr(addr)) {
         return exp_ram_[addr - 0xE000u];
+    }
+    if (IsFlashBufAddr(addr)) {
+        return flash_buf_dev_->Read(addr);
     }
     if (IsHighSpeedRamAddr(addr)) {
         return high_speed_ram_[addr - kHighSpeedRamStart];
@@ -227,6 +307,9 @@ uint8_t K0Bus::ReadCpu(uint16_t addr) {
 
 void K0Bus::WriteCpu(uint16_t addr, uint8_t value) {
     CheckWatchpoints(addr, true);
+    if (IsProgRomOverlaid(addr)) {
+        return;
+    }
     if (IsRomAddr(addr)) {
         if (rom_writable) {
             WriteRomByte(addr, value);
@@ -235,6 +318,10 @@ void K0Bus::WriteCpu(uint16_t addr, uint8_t value) {
     }
     if (IsExpRamAddr(addr)) {
         exp_ram_[addr - 0xE000u] = value;
+        return;
+    }
+    if (IsFlashBufAddr(addr)) {
+        flash_buf_dev_->Write(addr, value);
         return;
     }
     if (IsHighSpeedRamAddr(addr)) {
@@ -262,11 +349,17 @@ void K0Bus::WriteCpu(uint16_t addr, uint8_t value) {
 }
 
 uint8_t K0Bus::PeekByte(uint16_t addr) const {
+    if (IsProgRomOverlaid(addr)) {
+        return ReadProgRomByte(addr);
+    }
     if (IsRomAddr(addr)) {
         return ReadRomByte(addr);
     }
     if (IsExpRamAddr(addr)) {
         return exp_ram_[addr - 0xE000u];
+    }
+    if (IsFlashBufAddr(addr)) {
+        return flash_buf_dev_->Peek(addr);
     }
     if (IsHighSpeedRamAddr(addr)) {
         return high_speed_ram_[addr - kHighSpeedRamStart];
@@ -285,12 +378,19 @@ uint8_t K0Bus::PeekByte(uint16_t addr) const {
 }
 
 void K0Bus::PokeByte(uint16_t addr, uint8_t value) {
+    if (IsProgRomOverlaid(addr)) {
+        return;
+    }
     if (IsRomAddr(addr)) {
         WriteRomByte(addr, value);
         return;
     }
     if (IsExpRamAddr(addr)) {
         exp_ram_[addr - 0xE000u] = value;
+        return;
+    }
+    if (IsFlashBufAddr(addr)) {
+        flash_buf_dev_->Poke(addr, value);
         return;
     }
     if (IsHighSpeedRamAddr(addr)) {
@@ -393,6 +493,15 @@ std::vector<MemoryRegion> K0Bus::GetRegions() const {
             "EXP_RAM",
             false,
             MEM_PERM_RWX,
+        });
+    }
+    if (flash_buf_dev_ != nullptr) {
+        regions.push_back(MemoryRegion{
+            kFlashBufStart,
+            0x0010u,
+            "FLASH_BUF",
+            true,
+            MEM_PERM_RW,
         });
     }
     if (ram_start_ <= kHighSpeedRamEnd) {
